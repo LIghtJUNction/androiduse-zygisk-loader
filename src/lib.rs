@@ -17,6 +17,7 @@ use log::LevelFilter;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::OnceLock;
 
 pub use api::ZygiskApi;
@@ -50,6 +51,8 @@ fn write_file(path: &str, data: &[u8]) -> std::io::Result<()> {
     let mut f = File::create(path)?;
     f.write_all(data)?;
     f.sync_all()?;
+    let permissions = std::fs::Permissions::from_mode(0o700);
+    std::fs::set_permissions(path, permissions)?;
     Ok(())
 }
 
