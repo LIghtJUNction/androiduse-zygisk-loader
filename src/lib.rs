@@ -85,6 +85,10 @@ impl ZygiskModule for ZygiskLoaderModule {
 
         let current_process = get_process_name_from_args_safe(args);
         let target_package = TARGET_CONFIG.get().map(|s| s.as_str()).unwrap_or("");
+        info!(
+            "Checking process target='{}' current='{}'",
+            target_package, current_process
+        );
 
         if !target_package.is_empty() && current_process.contains(target_package) {
             info!("Target Detected: {}", current_process);
@@ -120,6 +124,9 @@ impl ZygiskModule for ZygiskLoaderModule {
                 error!("Could not determine app data directory");
                 return;
             }
+            let process_name = get_process_name_from_args_safe(args);
+            set_payload_env("ANDROIDUSE_PROCESS_NAME", &process_name);
+            set_payload_env("ANDROIDUSE_APP_DATA_DIR", &data_dir);
 
             // Generate a random filename to avoid collisions and look like a cache file
             let file_name = format!("{}/cache/.res_{}.so", data_dir, rand_int());
@@ -173,11 +180,40 @@ fn get_process_name_from_args_safe(args: &AppSpecializeArgs) -> String {
             }
         }
     }
+    if let Some(cmdline) = read_proc_cmdline() {
+        return cmdline;
+    }
     let dir = get_app_data_dir_from_args(args);
     if !dir.is_empty() {
         return extract_package_from_path(&dir);
     }
     String::new()
+}
+
+fn read_proc_cmdline() -> Option<String> {
+    let mut value = std::fs::read_to_string("/proc/self/cmdline").ok()?;
+    if let Some(index) = value.find('\0') {
+        value.truncate(index);
+    }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn set_payload_env(key: &str, value: &str) {
+    let key = match CString::new(key) {
+        Ok(key) => key,
+        Err(_) => return,
+    };
+    let value = match CString::new(value) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    unsafe {
+        libc::setenv(key.as_ptr(), value.as_ptr(), 1);
+    }
 }
 
 fn get_app_data_dir_from_args(args: &AppSpecializeArgs) -> String {
