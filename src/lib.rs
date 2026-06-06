@@ -16,8 +16,8 @@ use log::LevelFilter;
 
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
 pub use api::ZygiskApi;
@@ -29,6 +29,27 @@ const CONFIG_PATH: &str = "/data/adb/modules/AndroidUse/.config/androiduse/zygis
 const REGISTRY_DIR: &str = "/data/adb/modules/AndroidUse/.config/androiduse/auzm.d";
 const FALLBACK_PAYLOAD_PATH: &str = "/data/adb/modules/AndroidUse/.config/androiduse/payload.so";
 const FALLBACK_MODULE_ID: &str = "androiduse-runtime";
+const ANDROID_DLEXT_USE_LIBRARY_FD: u64 = 0x10;
+const ANDROID_DLEXT_FORCE_LOAD: u64 = 0x40;
+
+#[repr(C)]
+struct AndroidDlExtInfo {
+    flags: u64,
+    reserved_addr: *mut libc::c_void,
+    reserved_size: libc::size_t,
+    relro_fd: libc::c_int,
+    library_fd: libc::c_int,
+    library_fd_offset: i64,
+    library_namespace: *mut libc::c_void,
+}
+
+extern "C" {
+    fn android_dlopen_ext(
+        filename: *const libc::c_char,
+        flags: libc::c_int,
+        extinfo: *const AndroidDlExtInfo,
+    ) -> *mut libc::c_void;
+}
 
 static MODULE: ZygiskLoaderModule = ZygiskLoaderModule {};
 crate::zygisk_module!(&MODULE);
@@ -59,15 +80,6 @@ fn rand_int() -> u32 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .subsec_nanos()
-}
-
-fn write_file(path: &str, data: &[u8]) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    let permissions = std::fs::Permissions::from_mode(0o700);
-    std::fs::set_permissions(path, permissions)?;
-    Ok(())
 }
 
 fn read_file_to_memory(path: &str) -> std::io::Result<Vec<u8>> {
@@ -154,55 +166,101 @@ impl ZygiskModule for ZygiskLoaderModule {
             set_payload_env("ANDROIDUSE_APP_DATA_DIR", &data_dir);
 
             for payload in buffers {
-                load_payload_from_memory(payload, &data_dir);
+                load_payload_from_memory(payload);
             }
         }
     }
 }
 
-fn load_payload_from_memory(payload: &PayloadBuffer, data_dir: &str) {
-    // Generate a random filename to avoid collisions and look like a cache file.
-    let file_name = format!(
-        "{}/cache/.androiduse_{}_{}.so",
-        data_dir,
-        safe_file_label(&payload.id),
-        rand_int()
-    );
+fn load_payload_from_memory(payload: &PayloadBuffer) {
+    let label = format!("androiduse_{}_{}", safe_file_label(&payload.id), rand_int());
 
-    info!(
-        "Attempting AUZM '{}' injection to: {}",
-        payload.id, file_name
-    );
+    info!("Attempting AUZM '{}' memfd injection", payload.id);
 
-    match write_file(&file_name, &payload.data) {
-        Ok(_) => {
-            let c_path = match CString::new(file_name.clone()) {
-                Ok(path) => path,
-                Err(err) => {
-                    error!("Invalid cache path for AUZM '{}': {}", payload.id, err);
-                    let _ = fs::remove_file(&file_name);
-                    return;
-                }
-            };
-            unsafe {
-                let handle = libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW);
-
-                // The kernel keeps the mapping alive after unlink while the handle remains loaded.
-                let _ = fs::remove_file(&file_name);
-
-                if handle.is_null() {
-                    let err = CStr::from_ptr(libc::dlerror()).to_string_lossy();
-                    error!("AUZM '{}' injection failed: {}", payload.id, err);
-                } else {
-                    info!(
-                        "AUZM '{}' injection success! Handle: {:p}",
-                        payload.id, handle
-                    );
-                }
-            }
+    let fd = match create_memfd_with_payload(&label, &payload.data) {
+        Ok(fd) => fd,
+        Err(err) => {
+            error!("Failed to create memfd for AUZM '{}': {}", payload.id, err);
+            return;
         }
-        Err(err) => error!("Failed to write AUZM '{}': {}", payload.id, err),
+    };
+    let c_path = match CString::new(format!("/proc/self/fd/{fd}")) {
+        Ok(path) => path,
+        Err(err) => {
+            error!("Invalid memfd path for AUZM '{}': {}", payload.id, err);
+            unsafe {
+                libc::close(fd);
+            }
+            return;
+        }
+    };
+
+    let extinfo = AndroidDlExtInfo {
+        flags: ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD,
+        reserved_addr: std::ptr::null_mut(),
+        reserved_size: 0,
+        relro_fd: -1,
+        library_fd: fd,
+        library_fd_offset: 0,
+        library_namespace: std::ptr::null_mut(),
+    };
+
+    unsafe {
+        let handle = android_dlopen_ext(c_path.as_ptr(), libc::RTLD_NOW, &extinfo);
+        let _ = libc::close(fd);
+
+        if handle.is_null() {
+            let err = CStr::from_ptr(libc::dlerror()).to_string_lossy();
+            error!("AUZM '{}' memfd injection failed: {}", payload.id, err);
+        } else {
+            info!(
+                "AUZM '{}' memfd injection success! Handle: {:p}",
+                payload.id, handle
+            );
+        }
     }
+}
+
+fn create_memfd_with_payload(label: &str, data: &[u8]) -> std::io::Result<RawFd> {
+    let name = CString::new(label).unwrap_or_else(|_| CString::new("androiduse_module").unwrap());
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let write_result = write_all_fd(fd, data).and_then(|_| {
+        let seek = unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+        if seek < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(err) = write_result {
+        unsafe {
+            libc::close(fd);
+        }
+        Err(err)
+    } else {
+        Ok(fd)
+    }
+}
+
+fn write_all_fd(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let written = unsafe {
+            libc::write(
+                fd,
+                data.as_ptr().cast::<libc::c_void>(),
+                data.len() as libc::size_t,
+            )
+        };
+        if written < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        data = &data[written as usize..];
+    }
+    Ok(())
 }
 
 fn read_auzm_registry() -> Vec<AuzmEntry> {
