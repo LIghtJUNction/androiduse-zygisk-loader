@@ -12,13 +12,25 @@ The loader reads AndroidUse-owned runtime files:
 
 ```text
 /data/adb/modules/AndroidUse/.config/androiduse/zygisk-target
-/data/adb/modules/AndroidUse/.config/androiduse/payload.so
+/data/adb/modules/AndroidUse/.config/androiduse/auzm.d/<module-id>/
 ```
 
-`zygisk-target` contains the target package/process name. When a matching app
-specializes, the loader buffers `payload.so` while still in the Zygote phase,
-writes it to the target app cache after specialization, loads it with `dlopen`,
-then unlinks the temporary cache file.
+Each AUZM registry directory contains small text files:
+
+```text
+enabled
+name
+scope
+path
+payload.so
+```
+
+`scope` contains package/process match strings, one per line. When a matching
+app specializes, the loader buffers every enabled AUZM whose scope matches while
+still in the Zygote phase, writes each `.so` to the target app cache after
+specialization, loads it with `dlopen`, then unlinks the temporary cache file.
+`zygisk-target` is preserved as compatibility config for older installs and the
+default runtime module.
 
 ## Build
 

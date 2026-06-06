@@ -15,7 +15,7 @@ use android_logger::Config;
 use log::LevelFilter;
 
 use std::ffi::{CStr, CString};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::OnceLock;
@@ -26,7 +26,9 @@ use jni::{JNIEnv, JavaVM};
 pub use module::ZygiskModule;
 
 const CONFIG_PATH: &str = "/data/adb/modules/AndroidUse/.config/androiduse/zygisk-target";
-const SOURCE_PAYLOAD_PATH: &str = "/data/adb/modules/AndroidUse/.config/androiduse/payload.so";
+const REGISTRY_DIR: &str = "/data/adb/modules/AndroidUse/.config/androiduse/auzm.d";
+const FALLBACK_PAYLOAD_PATH: &str = "/data/adb/modules/AndroidUse/.config/androiduse/payload.so";
+const FALLBACK_MODULE_ID: &str = "androiduse-runtime";
 
 static MODULE: ZygiskLoaderModule = ZygiskLoaderModule {};
 crate::zygisk_module!(&MODULE);
@@ -34,9 +36,21 @@ crate::zygisk_module!(&MODULE);
 struct ZygiskLoaderModule {}
 
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
-static TARGET_CONFIG: OnceLock<String> = OnceLock::new();
-static PAYLOAD_BUFFER: OnceLock<Vec<u8>> = OnceLock::new();
+static PAYLOAD_BUFFERS: OnceLock<Vec<PayloadBuffer>> = OnceLock::new();
 static TARGET_APP_DETECTED: OnceLock<bool> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct AuzmEntry {
+    id: String,
+    path: String,
+    scope: String,
+}
+
+#[derive(Debug)]
+struct PayloadBuffer {
+    id: String,
+    data: Vec<u8>,
+}
 
 fn rand_int() -> u32 {
     // Simple pseudo-random for filename obfuscation using time
@@ -78,35 +92,46 @@ impl ZygiskModule for ZygiskLoaderModule {
     }
 
     fn pre_app_specialize(&self, _api: ZygiskApi, args: &mut AppSpecializeArgs) {
-        // 1. Read Config (As Root/Zygote)
-        if let Ok(target) = read_target_config() {
-            let _ = TARGET_CONFIG.set(target);
-        }
-
         let current_process = get_process_name_from_args_safe(args);
-        let target_package = TARGET_CONFIG.get().map(|s| s.as_str()).unwrap_or("");
+        let entries = read_auzm_registry();
         info!(
-            "Checking process target='{}' current='{}'",
-            target_package, current_process
+            "Checking AUZM registry entries={} current='{}'",
+            entries.len(),
+            current_process
         );
 
-        if !target_package.is_empty() && current_process.contains(target_package) {
-            info!("Target Detected: {}", current_process);
-            let _ = TARGET_APP_DETECTED.set(true);
-
-            // 2. Read Payload to RAM
-            match read_file_to_memory(SOURCE_PAYLOAD_PATH) {
-                Ok(buffer) => {
-                    info!("Payload buffered to RAM: {} bytes", buffer.len());
-                    let _ = PAYLOAD_BUFFER.set(buffer);
+        let mut buffers = Vec::new();
+        for entry in entries {
+            if !scope_matches(&entry.scope, &current_process) {
+                continue;
+            }
+            match read_file_to_memory(&entry.path) {
+                Ok(data) => {
+                    info!(
+                        "AUZM '{}' buffered to RAM from {}: {} bytes",
+                        entry.id,
+                        entry.path,
+                        data.len()
+                    );
+                    buffers.push(PayloadBuffer { id: entry.id, data });
                 }
-                Err(e) => {
+                Err(err) => {
                     error!(
-                        "Failed to buffer payload from {}: {}",
-                        SOURCE_PAYLOAD_PATH, e
+                        "Failed to buffer AUZM '{}' from {}: {}",
+                        entry.id, entry.path, err
                     );
                 }
             }
+        }
+
+        if !buffers.is_empty() {
+            info!(
+                "Target Detected: {} AUZM module(s) match {}",
+                buffers.len(),
+                current_process
+            );
+            let _ = TARGET_APP_DETECTED.set(true);
+            let _ = PAYLOAD_BUFFERS.set(buffers);
         }
     }
 
@@ -115,7 +140,7 @@ impl ZygiskModule for ZygiskLoaderModule {
             return;
         }
 
-        if let Some(buffer) = PAYLOAD_BUFFER.get() {
+        if let Some(buffers) = PAYLOAD_BUFFERS.get() {
             // FIX: Use app_data_dir directly instead of nice_name
             // This ensures we write to the correct folder even for isolated processes (e.g., :remote)
             let data_dir = get_app_data_dir_from_args(args);
@@ -128,33 +153,136 @@ impl ZygiskModule for ZygiskLoaderModule {
             set_payload_env("ANDROIDUSE_PROCESS_NAME", &process_name);
             set_payload_env("ANDROIDUSE_APP_DATA_DIR", &data_dir);
 
-            // Generate a random filename to avoid collisions and look like a cache file
-            let file_name = format!("{}/cache/.res_{}.so", data_dir, rand_int());
-
-            info!("Attempting injection to: {}", file_name);
-
-            match write_file(&file_name, buffer) {
-                Ok(_) => {
-                    let c_path = CString::new(file_name.clone()).unwrap();
-                    unsafe {
-                        let handle = libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW);
-
-                        // Immediately unlink (delete) the file from disk
-                        // The kernel keeps the file in memory as long as it's mapped,
-                        // but the file entry is removed from the filesystem.
-                        let _ = std::fs::remove_file(&file_name);
-
-                        if handle.is_null() {
-                            let err = CStr::from_ptr(libc::dlerror()).to_string_lossy();
-                            error!("Injection failed: {}", err);
-                        } else {
-                            info!("Injection success! Handle: {:p}", handle);
-                        }
-                    }
-                }
-                Err(e) => error!("Failed to write payload: {}", e),
+            for payload in buffers {
+                load_payload_from_memory(payload, &data_dir);
             }
         }
+    }
+}
+
+fn load_payload_from_memory(payload: &PayloadBuffer, data_dir: &str) {
+    // Generate a random filename to avoid collisions and look like a cache file.
+    let file_name = format!(
+        "{}/cache/.androiduse_{}_{}.so",
+        data_dir,
+        safe_file_label(&payload.id),
+        rand_int()
+    );
+
+    info!(
+        "Attempting AUZM '{}' injection to: {}",
+        payload.id, file_name
+    );
+
+    match write_file(&file_name, &payload.data) {
+        Ok(_) => {
+            let c_path = match CString::new(file_name.clone()) {
+                Ok(path) => path,
+                Err(err) => {
+                    error!("Invalid cache path for AUZM '{}': {}", payload.id, err);
+                    let _ = fs::remove_file(&file_name);
+                    return;
+                }
+            };
+            unsafe {
+                let handle = libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW);
+
+                // The kernel keeps the mapping alive after unlink while the handle remains loaded.
+                let _ = fs::remove_file(&file_name);
+
+                if handle.is_null() {
+                    let err = CStr::from_ptr(libc::dlerror()).to_string_lossy();
+                    error!("AUZM '{}' injection failed: {}", payload.id, err);
+                } else {
+                    info!(
+                        "AUZM '{}' injection success! Handle: {:p}",
+                        payload.id, handle
+                    );
+                }
+            }
+        }
+        Err(err) => error!("Failed to write AUZM '{}': {}", payload.id, err),
+    }
+}
+
+fn read_auzm_registry() -> Vec<AuzmEntry> {
+    let mut entries = Vec::new();
+    if let Ok(dir) = fs::read_dir(REGISTRY_DIR) {
+        for item in dir.flatten() {
+            let path = item.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !is_enabled(&path) {
+                continue;
+            }
+            let payload_path = read_trimmed(path.join("path"))
+                .or_else(|| read_trimmed(path.join("payload")))
+                .unwrap_or_else(|| format!("{REGISTRY_DIR}/{id}/payload.so"));
+            let scope = read_trimmed(path.join("scope")).unwrap_or_default();
+            if payload_path.is_empty() || scope.is_empty() {
+                continue;
+            }
+            entries.push(AuzmEntry {
+                id: id.to_owned(),
+                path: payload_path,
+                scope,
+            });
+        }
+    }
+    if entries.is_empty() {
+        entries.extend(read_fallback_entry());
+    }
+    entries
+}
+
+fn read_fallback_entry() -> Option<AuzmEntry> {
+    let scope = read_target_config()
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    Some(AuzmEntry {
+        id: FALLBACK_MODULE_ID.to_owned(),
+        path: FALLBACK_PAYLOAD_PATH.to_owned(),
+        scope,
+    })
+}
+
+fn is_enabled(dir: &std::path::Path) -> bool {
+    let value = read_trimmed(dir.join("enabled")).unwrap_or_else(|| "1".to_owned());
+    matches!(
+        value.as_str(),
+        "" | "1" | "true" | "yes" | "on" | "enabled" | "active"
+    )
+}
+
+fn read_trimmed(path: impl AsRef<std::path::Path>) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+}
+
+fn scope_matches(scope: &str, process: &str) -> bool {
+    scope
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .any(|line| line == "*" || process.contains(line))
+}
+
+fn safe_file_label(value: &str) -> String {
+    let mut label = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            label.push(ch);
+        }
+    }
+    if label.is_empty() {
+        "module".to_owned()
+    } else {
+        label
     }
 }
 
