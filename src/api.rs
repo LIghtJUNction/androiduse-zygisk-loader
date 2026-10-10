@@ -187,8 +187,8 @@ impl<'a> ZygiskApi<'a> {
     ) {
         if let Some(func) = self.inner.plt_hook_register_v4 {
             func(
-                dev.try_into().unwrap(),
-                ino.try_into().unwrap(),
+                dev,
+                ino,
                 symbol.as_ptr(),
                 new_func,
                 old_func

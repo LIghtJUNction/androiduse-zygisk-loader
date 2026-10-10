@@ -16,7 +16,7 @@ use log::LevelFilter;
 
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
@@ -82,13 +82,6 @@ fn rand_int() -> u32 {
         .subsec_nanos()
 }
 
-fn read_file_to_memory(path: &str) -> std::io::Result<Vec<u8>> {
-    let mut f = File::open(path)?;
-    let mut buffer = Vec::new();
-    f.read_to_end(&mut buffer)?;
-    Ok(buffer)
-}
-
 impl ZygiskModule for ZygiskLoaderModule {
     fn on_load(&self, _api: ZygiskApi, env: &mut JNIEnv) {
         #[cfg(target_os = "android")]
@@ -117,7 +110,7 @@ impl ZygiskModule for ZygiskLoaderModule {
             if !scope_matches(&entry.scope, &current_process) {
                 continue;
             }
-            match read_file_to_memory(&entry.path) {
+            match fs::read(&entry.path) {
                 Ok(data) => {
                     info!(
                         "AUZM '{}' buffered to RAM from {}: {} bytes",
