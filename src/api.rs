@@ -177,6 +177,7 @@ impl<'a> ZygiskApi<'a> {
     ///
     /// This function is unsafe, since a badly designed hook or misuse of raw pointers may lead to
     /// memory unsafety.
+    #[allow(clippy::useless_conversion)] // Checked conversion is required on 32-bit Android.
     pub unsafe fn plt_hook_register_v4(
         &self,
         dev: u64,
@@ -187,8 +188,8 @@ impl<'a> ZygiskApi<'a> {
     ) {
         if let Some(func) = self.inner.plt_hook_register_v4 {
             func(
-                dev,
-                ino,
+                dev.try_into().unwrap(),
+                ino.try_into().unwrap(),
                 symbol.as_ptr(),
                 new_func,
                 old_func
